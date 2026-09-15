@@ -100,26 +100,34 @@ describe("runUnaryCall()", () => {
     });
     expect(signal?.aborted).toBeTrue();
   });
-  it("should raise Code.Canceled on user abort", async () => {
-    const userAbort = new AbortController();
-    const resPromise = runUnaryCall<
-      typeof Int32ValueSchema,
-      typeof StringValueSchema
-    >({
-      signal: userAbort.signal,
-      req: makeReq(),
-      async next(req) {
-        for (;;) {
-          await new Promise((resolve) => setTimeout(resolve, 1));
-          req.signal.throwIfAborted();
-        }
-      },
+  for (const reason of [
+    undefined,
+    "caller stopped",
+    new Error("caller stopped"),
+  ]) {
+    it(`should raise Code.Canceled on user abort with ${typeof reason} reason`, async () => {
+      const userAbort = new AbortController();
+      const resPromise = runUnaryCall<
+        typeof Int32ValueSchema,
+        typeof StringValueSchema
+      >({
+        signal: userAbort.signal,
+        req: makeReq(),
+        async next(req) {
+          for (;;) {
+            await new Promise((resolve) => setTimeout(resolve, 1));
+            req.signal.throwIfAborted();
+          }
+        },
+      });
+      userAbort.abort(reason);
+      await expectAsync(resPromise).toBeRejectedWithError(
+        reason === undefined
+          ? "[canceled] This operation was aborted"
+          : "[canceled] caller stopped",
+      );
     });
-    userAbort.abort();
-    await expectAsync(resPromise).toBeRejectedWithError(
-      "[canceled] This operation was aborted",
-    );
-  });
+  }
   it("should raise Code.DeadlineExceeded on timeout", async () => {
     const resPromise = runUnaryCall<
       typeof Int32ValueSchema,
@@ -314,6 +322,104 @@ describe("runStreamingCall()", () => {
         };
       };
     }
+
+    it("lets an interceptor retry failed setup without closing the request", async () => {
+      let attempts = 0;
+      let setupError: unknown;
+      const finished = jasmine.createSpy("finished");
+      const res = await runStreamingCall({
+        req: makeReq(),
+        interceptors: [
+          trace(finished),
+          (next) => async (req) => {
+            try {
+              return await next(req);
+            } catch (reason) {
+              setupError = reason;
+              return next(req);
+            }
+          },
+        ],
+        async next(req) {
+          attempts++;
+          if (attempts === 1) {
+            throw new ConnectError("try again", Code.Unavailable);
+          }
+          expect(req.signal.aborted).toBeFalse();
+          const input = [];
+          for await (const message of req.message) {
+            input.push(message.value);
+          }
+          expect(input).toEqual([1, 2, 3]);
+          return makeRes(req);
+        },
+      });
+      const values = [];
+      for await (const message of res.message) {
+        values.push(message.value);
+      }
+      expect(values).toEqual(["1", "2", "3"]);
+      expect(setupError).toEqual(
+        jasmine.objectContaining({ code: Code.Unavailable }),
+      );
+      expect(attempts).toBe(2);
+      expect(finished).toHaveBeenCalledOnceWith(undefined);
+    });
+
+    it("lets an interceptor recover from response and cleanup errors", async () => {
+      const sourceError = new ConnectError("read failed", Code.Unavailable);
+      sourceError.details = [
+        { type: Int32ValueSchema.typeName, value: Uint8Array.of(8, 7) },
+      ];
+      let returned = 0;
+      let recoveredError: unknown;
+      const finished = jasmine.createSpy("finished");
+      const res = await runStreamingCall({
+        req: makeReq(),
+        interceptors: [
+          trace(finished),
+          (next) => async (req) => {
+            const res = await next(req);
+            if (!res.stream) {
+              return res;
+            }
+            return {
+              ...res,
+              message: (async function* () {
+                try {
+                  yield* res.message;
+                } catch (reason) {
+                  recoveredError = reason;
+                  yield create(StringValueSchema, { value: "fallback" });
+                }
+              })(),
+            };
+          },
+        ],
+        async next(req) {
+          return {
+            ...makeRes(req),
+            message: {
+              [Symbol.asyncIterator]: () => ({
+                next: () => Promise.reject(sourceError),
+                return: () => {
+                  returned++;
+                  return Promise.reject(new Error("cleanup failed"));
+                },
+              }),
+            },
+          };
+        },
+      });
+      const values = [];
+      for await (const message of res.message) {
+        values.push(message.value);
+      }
+      expect(values).toEqual(["fallback"]);
+      expect(recoveredError).toBe(sourceError);
+      expect(returned).toBe(1);
+      expect(finished).toHaveBeenCalledOnceWith(undefined);
+    });
 
     it("rejects an initial abort without starting interceptors or the transport", async () => {
       const controller = new AbortController();

@@ -156,9 +156,9 @@ export async function runStreamingCall<
     if (state instanceof ConnectError) {
       return state;
     }
-    const error = ConnectError.from(
-      signal.aborted ? getAbortSignalReason(signal) : reason,
-    );
+    const error = signal.aborted
+      ? ConnectError.from(getAbortSignalReason(signal), Code.Canceled)
+      : ConnectError.from(reason);
     state = error;
     signal.removeEventListener("abort", onAbort);
     // Interrupt pending reads before waiting for iterator cleanup.
@@ -198,6 +198,7 @@ export async function runStreamingCall<
           ...res,
           message: (async function* () {
             const it = res.message[Symbol.asyncIterator]();
+            let pendingSourceError: ConnectError | undefined;
             try {
               for (;;) {
                 if (checkSignal() === "returned") {
@@ -214,21 +215,26 @@ export async function runStreamingCall<
               }
             } catch (reason) {
               if (state !== "returned") {
-                throw fail(reason);
+                checkSignal();
+                pendingSourceError = ConnectError.from(reason);
+                throw pendingSourceError;
               }
             } finally {
               await Promise.resolve()
                 .then(() => it.return?.())
                 .catch((reason) => {
                   if (state !== "returned") {
-                    throw fail(reason);
+                    checkSignal();
+                    throw pendingSourceError ?? ConnectError.from(reason);
                   }
                 });
             }
           })(),
         };
       } catch (reason) {
-        throw fail(reason);
+        // Interceptors may retry or recover ordinary transport errors.
+        checkSignal();
+        throw ConnectError.from(reason);
       }
     }, opt.interceptors);
     const res = await next(req);
@@ -320,11 +326,14 @@ function setupSignal(opt: {
   return [
     controller.signal,
     function abort(reason: unknown): Promise<never> {
-      // We peek at the deadline signal because fetch() will throw an error on
-      // abort that discards the signal reason.
-      const e = ConnectError.from(
-        signal.aborted ? getAbortSignalReason(signal) : reason,
-      );
+      // We peek at the signal because fetch() will throw an error on abort
+      // that discards the signal reason.
+      const e = controller.signal.aborted
+        ? ConnectError.from(
+            getAbortSignalReason(controller.signal),
+            Code.Canceled,
+          )
+        : ConnectError.from(reason);
       controller.abort(e);
       cleanup();
       return Promise.reject(e);
