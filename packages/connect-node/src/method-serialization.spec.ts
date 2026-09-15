@@ -115,21 +115,6 @@ for (const [protocol, createTransport] of [
               sockets.add(socket);
             }),
         );
-        afterEach(() => {
-          assert.strictEqual(factoryCalls, 1);
-          const received = Buffer.concat(requestChunks);
-          if (serializeError || requestBytes.byteLength > 32) {
-            assert.strictEqual(received.byteLength, 0);
-          } else {
-            assert.deepStrictEqual(
-              received,
-              Buffer.from(
-                enveloped ? encodeEnvelope(0, requestBytes) : requestBytes,
-              ),
-            );
-          }
-        });
-
         async function call(useCustomSerialization: boolean) {
           const options = {
             baseUrl: server.getUrl(),
@@ -180,20 +165,35 @@ for (const [protocol, createTransport] of [
               };
             },
           } satisfies ConnectTransportOptions;
-          const client = createClient(ElizaService, createTransport(options));
-          if (stream) {
-            const messages = [];
-            for await (const message of client.introduce({
-              name: "request",
-            })) {
-              messages.push(message);
+          try {
+            const client = createClient(ElizaService, createTransport(options));
+            if (stream) {
+              const messages = [];
+              for await (const message of client.introduce({
+                name: "request",
+              })) {
+                messages.push(message);
+              }
+              assert.deepStrictEqual(messages, [output]);
+            } else {
+              assert.deepStrictEqual(
+                await client.say({ sentence: "request" }),
+                output,
+              );
             }
-            assert.deepStrictEqual(messages, [output]);
-          } else {
-            assert.deepStrictEqual(
-              await client.say({ sentence: "request" }),
-              output,
-            );
+          } finally {
+            assert.strictEqual(factoryCalls, 1);
+            const received = Buffer.concat(requestChunks);
+            if (serializeError || requestBytes.byteLength > 32) {
+              assert.strictEqual(received.byteLength, 0);
+            } else {
+              assert.deepStrictEqual(
+                received,
+                Buffer.from(
+                  enveloped ? encodeEnvelope(0, requestBytes) : requestBytes,
+                ),
+              );
+            }
           }
         }
 
