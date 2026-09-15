@@ -15,6 +15,7 @@
 import { create } from "@bufbuild/protobuf";
 import { runStreamingCall, runUnaryCall } from "./run-call.js";
 import type {
+  Interceptor,
   StreamRequest,
   StreamResponse,
   UnaryRequest,
@@ -24,6 +25,8 @@ import { createAsyncIterable } from "./async-iterable.js";
 import { createContextValues } from "../context-values.js";
 import { createServiceDesc } from "../descriptor-helper.spec.js";
 import { Int32ValueSchema, StringValueSchema } from "@bufbuild/protobuf/wkt";
+import { Code } from "../code.js";
+import { ConnectError } from "../connect-error.js";
 
 const TestService = createServiceDesc({
   typeName: "TestService",
@@ -191,10 +194,9 @@ describe("runStreamingCall()", () => {
     expect(values).toEqual(["1", "2", "3"]);
     const it = req.message[Symbol.asyncIterator]();
     expect(await it.next()).toEqual({ done: true, value: undefined });
-    // Check to see if response iterator doesn't provide throw/return.
     const resIt = res.message[Symbol.asyncIterator]();
-    expect(resIt.throw).not.toBeDefined(); // eslint-disable-line  @typescript-eslint/unbound-method
-    expect(resIt.return).not.toBeDefined(); // eslint-disable-line  @typescript-eslint/unbound-method
+    expect(resIt.throw).toBeDefined(); // eslint-disable-line  @typescript-eslint/unbound-method
+    expect(resIt.return).toBeDefined(); // eslint-disable-line  @typescript-eslint/unbound-method
   });
   it("should trigger the signal when done", async () => {
     let signal: AbortSignal | undefined;
@@ -287,5 +289,540 @@ describe("runStreamingCall()", () => {
       }),
     ).toBeRejectedWithError("[unknown] foo");
     expect(reqError?.message).toEqual("[unknown] foo");
+  });
+
+  describe("response lifecycle", () => {
+    function trace(finished: (code: Code | undefined) => void): Interceptor {
+      return (next) => async (req) => {
+        const res = await next(req);
+        if (!res.stream) {
+          return res;
+        }
+        return {
+          ...res,
+          message: (async function* () {
+            let code: Code | undefined;
+            try {
+              yield* res.message;
+            } catch (e) {
+              code = ConnectError.from(e).code;
+              throw e;
+            } finally {
+              finished(code);
+            }
+          })(),
+        };
+      };
+    }
+
+    it("rejects an initial abort without starting interceptors or the transport", async () => {
+      const controller = new AbortController();
+      controller.abort();
+      const started = jasmine.createSpy("started");
+      const req = makeReq();
+      const returned = jasmine
+        .createSpy("returned")
+        .and.resolveTo({ done: true });
+      req.message = {
+        [Symbol.asyncIterator]: () => ({
+          next: () => Promise.resolve({ done: true, value: undefined }),
+          return: returned,
+        }),
+      };
+      await expectAsync(
+        runStreamingCall({
+          req,
+          signal: controller.signal,
+          interceptors: [
+            (next) => (request) => {
+              started();
+              return next(request);
+            },
+          ],
+          async next(request) {
+            started();
+            return makeRes(request);
+          },
+        }),
+      ).toBeRejectedWith(jasmine.objectContaining({ code: Code.Canceled }));
+      expect(started).not.toHaveBeenCalled();
+      expect(returned).toHaveBeenCalledTimes(1);
+    });
+
+    for (const action of ["abort", "return", "throw", "deadline"] as const) {
+      for (const position of [
+        "unread",
+        "first read",
+        "parked",
+        "pending read",
+      ] as const) {
+        it(`finalizes on ${action} while ${position}, retaining the error after cleanup`, async () => {
+          const controller = new AbortController();
+          const finished = jasmine.createSpy("finished");
+          const sourceClosed = jasmine.createSpy("sourceClosed");
+          const requestReturned = jasmine
+            .createSpy("requestReturned")
+            .and.resolveTo({ done: true });
+          const requestThrown = jasmine
+            .createSpy("requestThrown")
+            .and.rejectWith(new Error("cleanup"));
+          const req = makeReq();
+          const requestIterators = jasmine
+            .createSpy("requestIterators")
+            .and.callFake(() => ({
+              next: () =>
+                Promise.resolve({ done: false, value: { value: 123 } }),
+              return: requestReturned,
+              throw: requestThrown,
+            }));
+          req.message = { [Symbol.asyncIterator]: requestIterators };
+          let reads = 0;
+          let readStarted = () => {};
+          const reading = new Promise<void>((resolve) => {
+            readStarted = resolve;
+          });
+          const error = new ConnectError("consumer failed", Code.DataLoss);
+          const code =
+            action === "deadline"
+              ? Code.DeadlineExceeded
+              : action === "throw"
+                ? Code.DataLoss
+                : Code.Canceled;
+          jasmine.clock().install();
+          try {
+            const res = await runStreamingCall({
+              req,
+              signal: controller.signal,
+              timeoutMs: 100,
+              interceptors: [trace(finished)],
+              async next(request) {
+                await request.message[Symbol.asyncIterator]().next();
+                return {
+                  ...makeRes(request),
+                  message: (async function* () {
+                    try {
+                      if (position !== "first read") {
+                        reads++;
+                        yield create(StringValueSchema, { value: "first" });
+                      }
+                      reads++;
+                      readStarted();
+                      if (!request.signal.aborted) {
+                        await new Promise<void>((resolve) =>
+                          request.signal.addEventListener(
+                            "abort",
+                            () => resolve(),
+                            { once: true },
+                          ),
+                        );
+                      }
+                      // A transport may finish with successful EOF on abort.
+                    } finally {
+                      sourceClosed();
+                    }
+                  })(),
+                };
+              },
+            });
+            const it = res.message[Symbol.asyncIterator]();
+            expect(reads).toBe(0);
+            if (position === "parked" || position === "pending read") {
+              expect((await it.next()).value).toEqual(
+                create(StringValueSchema, { value: "first" }),
+              );
+              expect(reads).toBe(1);
+              expect(finished).not.toHaveBeenCalled();
+            }
+            const pending =
+              position === "first read" || position === "pending read"
+                ? expectAsync(it.next()).toBeRejectedWith(
+                    jasmine.objectContaining({ code }),
+                  )
+                : undefined;
+            if (pending) {
+              await reading;
+            }
+            let closing: PromiseLike<unknown> | undefined;
+            if (action === "deadline") {
+              jasmine.clock().tick(100);
+            } else if (action === "abort") {
+              controller.abort();
+            } else if (action === "return") {
+              if (!it.return) {
+                throw new Error("response iterator must provide return()");
+              }
+              closing = it.return();
+            } else {
+              if (!it.throw) {
+                throw new Error("response iterator must provide throw()");
+              }
+              closing = expectAsync(it.throw(error)).toBeRejectedWith(error);
+            }
+            jasmine.clock().uninstall();
+            await closing;
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            expect(finished).toHaveBeenCalledOnceWith(code);
+            if (position !== "unread") {
+              expect(sourceClosed).toHaveBeenCalledTimes(1);
+            }
+            expect(requestIterators).toHaveBeenCalledTimes(1);
+            expect(requestReturned).toHaveBeenCalledTimes(1);
+            expect(requestThrown).toHaveBeenCalledTimes(1);
+            await expectAsync(it.next()).toBeRejectedWith(
+              jasmine.objectContaining({ code }),
+            );
+            await it.return?.();
+            await it.return?.();
+            expect(finished).toHaveBeenCalledTimes(1);
+            expect(requestReturned).toHaveBeenCalledTimes(1);
+            await pending;
+          } finally {
+            controller.abort();
+            jasmine.clock().uninstall();
+          }
+        }, 1000);
+      }
+    }
+
+    it("reports cancellation through a buffering interceptor without prefetching", async () => {
+      const finished = jasmine.createSpy("finished");
+      const sourceClosed = jasmine.createSpy("sourceClosed");
+      let sourceReads = 0;
+      const duplicate: Interceptor = (next) => async (req) => {
+        const res = await next(req);
+        if (!res.stream) {
+          return res;
+        }
+        return {
+          ...res,
+          message: (async function* () {
+            for await (const message of res.message) {
+              for (let i = 0; i < 3; i++) {
+                yield message;
+              }
+            }
+          })(),
+        };
+      };
+      const res = await runStreamingCall({
+        req: makeReq(),
+        interceptors: [trace(finished), duplicate],
+        async next(req) {
+          return {
+            ...makeRes(req),
+            message: (async function* () {
+              try {
+                for (const value of ["first", "second"]) {
+                  sourceReads++;
+                  yield create(StringValueSchema, { value });
+                }
+              } finally {
+                sourceClosed();
+              }
+            })(),
+          };
+        },
+      });
+      const it = res.message[Symbol.asyncIterator]();
+      expect(sourceReads).toBe(0);
+      expect((await it.next()).value).toEqual(
+        create(StringValueSchema, { value: "first" }),
+      );
+      expect(sourceReads).toBe(1);
+      await it.return?.();
+      expect(finished).toHaveBeenCalledOnceWith(Code.Canceled);
+      expect(sourceReads).toBe(1);
+      expect(sourceClosed).toHaveBeenCalledTimes(1);
+      await expectAsync(it.next()).toBeRejectedWith(
+        jasmine.objectContaining({ code: Code.Canceled }),
+      );
+    });
+
+    it("keeps normal completion successful and finalizes the consumed request iterator once", async () => {
+      const req = makeReq();
+      const returned = jasmine
+        .createSpy("returned")
+        .and.resolveTo({ done: true });
+      const thrown = jasmine.createSpy("thrown");
+      const iterators = jasmine.createSpy("iterators").and.callFake(() => ({
+        next: () => Promise.resolve({ done: false, value: { value: 123 } }),
+        return: returned,
+        throw: thrown,
+      }));
+      req.message = { [Symbol.asyncIterator]: iterators };
+      const finished = jasmine.createSpy("finished");
+      const controller = new AbortController();
+      const cleared = spyOn(globalThis, "clearTimeout").and.callThrough();
+      const res = await runStreamingCall({
+        req,
+        signal: controller.signal,
+        timeoutMs: 100,
+        interceptors: [trace(finished)],
+        async next(request) {
+          const input = request.message[Symbol.asyncIterator]();
+          await input.next();
+          await input.return?.();
+          return makeRes(request);
+        },
+      });
+      const values = [];
+      for await (const message of res.message) {
+        values.push(message.value);
+      }
+      expect(values).toEqual(["1", "2", "3"]);
+      controller.abort();
+      const it = res.message[Symbol.asyncIterator]();
+      expect(await it.next()).toEqual({ done: true, value: undefined });
+      await it.return?.();
+      expect(finished).toHaveBeenCalledOnceWith(undefined);
+      expect(iterators).toHaveBeenCalledTimes(1);
+      expect(returned).toHaveBeenCalledTimes(1);
+      expect(thrown).not.toHaveBeenCalled();
+      expect(cleared).toHaveBeenCalledTimes(1);
+    });
+
+    for (const frames of [0, 1]) {
+      it(`preserves response errors after ${frames} frames independently of trailers`, async () => {
+        const error = new ConnectError("broken frame", Code.InvalidArgument, {
+          "service-header": "value",
+        });
+        const finished = jasmine.createSpy("finished");
+        const res = await runStreamingCall({
+          req: makeReq(),
+          interceptors: [trace(finished)],
+          async next(req) {
+            return {
+              ...makeRes(req),
+              trailer: new Headers({ "grpc-status": "0" }),
+              message: (async function* () {
+                if (frames) {
+                  yield create(StringValueSchema);
+                }
+                throw error;
+              })(),
+            };
+          },
+        });
+        const it = res.message[Symbol.asyncIterator]();
+        if (frames) {
+          expect((await it.next()).done).not.toBeTrue();
+        }
+        await expectAsync(it.next()).toBeRejectedWith(error);
+        await expectAsync(it.next()).toBeRejectedWith(error);
+        await it.return?.();
+        expect(finished).toHaveBeenCalledOnceWith(Code.InvalidArgument);
+      });
+    }
+
+    it("keeps concurrent reads of successful EOF successful", async () => {
+      const cleared = spyOn(globalThis, "clearTimeout").and.callThrough();
+      const res = await runStreamingCall({
+        req: makeReq(),
+        timeoutMs: 100,
+        async next(req) {
+          return { ...makeRes(req), message: createAsyncIterable([]) };
+        },
+      });
+      const it = res.message[Symbol.asyncIterator]();
+      expect(await Promise.all([it.next(), it.next()])).toEqual([
+        { done: true, value: undefined },
+        { done: true, value: undefined },
+      ]);
+      expect(cleared).toHaveBeenCalledTimes(1);
+    });
+
+    it("preserves a queued read error after another read completes successfully", async () => {
+      const error = new ConnectError("late read failure", Code.DataLoss, {
+        "service-trailer": "value",
+      });
+      error.details = [{ type: "example.Detail", value: Uint8Array.of(8, 7) }];
+      let rejectRead = (_reason: unknown) => {};
+      const firstRead = new Promise<never>((_, reject) => {
+        rejectRead = reject;
+      });
+      const cleared = spyOn(globalThis, "clearTimeout").and.callThrough();
+      const res = await runStreamingCall({
+        req: makeReq(),
+        timeoutMs: 100,
+        interceptors: [
+          (next) => async (req) => {
+            const res = await next(req);
+            if (!res.stream) {
+              return res;
+            }
+            return {
+              ...res,
+              message: {
+                [Symbol.asyncIterator]() {
+                  let reads = 0;
+                  return {
+                    next() {
+                      reads++;
+                      return reads === 1
+                        ? firstRead
+                        : Promise.resolve({ done: true, value: undefined });
+                    },
+                  };
+                },
+              },
+            };
+          },
+        ],
+        async next(req) {
+          return makeRes(req);
+        },
+      });
+      const it = res.message[Symbol.asyncIterator]();
+      const read = it.next();
+      const pending = expectAsync(read).toBeRejectedWith(error);
+      expect(await it.next()).toEqual({ done: true, value: undefined });
+      rejectRead(error);
+      await pending;
+      expect(await read.catch((reason: unknown) => reason)).toBe(error);
+      expect(await it.next()).toEqual({ done: true, value: undefined });
+      expect(cleared).toHaveBeenCalledTimes(1);
+    });
+
+    it("finalizes a response received after cancellation during setup", async () => {
+      const controller = new AbortController();
+      const finished = jasmine.createSpy("finished");
+      const returned = jasmine
+        .createSpy("returned")
+        .and.resolveTo({ done: true });
+      const cleared = spyOn(globalThis, "clearTimeout").and.callThrough();
+      await expectAsync(
+        runStreamingCall({
+          req: makeReq(),
+          signal: controller.signal,
+          timeoutMs: 100,
+          interceptors: [trace(finished)],
+          async next(req) {
+            controller.abort();
+            return {
+              ...makeRes(req),
+              message: {
+                [Symbol.asyncIterator]: () => ({
+                  next: () => Promise.resolve({ done: true, value: undefined }),
+                  return: returned,
+                }),
+              },
+            };
+          },
+        }),
+      ).toBeRejectedWith(jasmine.objectContaining({ code: Code.Canceled }));
+      expect(finished).toHaveBeenCalledOnceWith(Code.Canceled);
+      expect(returned).toHaveBeenCalledTimes(1);
+      expect(cleared).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports cancellation to interceptors when the transport loses the abort reason", async () => {
+      const controller = new AbortController();
+      const failed = jasmine.createSpy("failed");
+      await expectAsync(
+        runStreamingCall({
+          req: makeReq(),
+          signal: controller.signal,
+          interceptors: [
+            (next) => async (req) => {
+              try {
+                return await next(req);
+              } catch (e) {
+                failed(ConnectError.from(e).code);
+                throw e;
+              }
+            },
+          ],
+          async next() {
+            controller.abort();
+            throw new TypeError("fetch failed");
+          },
+        }),
+      ).toBeRejectedWith(jasmine.objectContaining({ code: Code.Canceled }));
+      expect(failed).toHaveBeenCalledOnceWith(Code.Canceled);
+    });
+
+    it("releases the request and deadline when an interceptor factory throws", async () => {
+      const req = makeReq();
+      const returned = jasmine
+        .createSpy("returned")
+        .and.resolveTo({ done: true });
+      req.message = {
+        [Symbol.asyncIterator]: () => ({
+          next: () => Promise.resolve({ done: true, value: undefined }),
+          return: returned,
+        }),
+      };
+      const cleared = spyOn(globalThis, "clearTimeout").and.callThrough();
+      const error = new ConnectError("interceptor failed", Code.Internal);
+      await expectAsync(
+        runStreamingCall({
+          req,
+          timeoutMs: 100,
+          interceptors: [
+            () => {
+              throw error;
+            },
+          ],
+          async next(request) {
+            return makeRes(request);
+          },
+        }),
+      ).toBeRejectedWith(error);
+      expect(returned).toHaveBeenCalledTimes(1);
+      expect(cleared).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not replace cancellation with a response cleanup error", async () => {
+      const controller = new AbortController();
+      const finished = jasmine.createSpy("finished");
+      const returned = jasmine
+        .createSpy("returned")
+        .and.rejectWith(new Error("cleanup failed"));
+      const res = await runStreamingCall({
+        req: makeReq(),
+        signal: controller.signal,
+        interceptors: [trace(finished)],
+        async next(req) {
+          return {
+            ...makeRes(req),
+            message: {
+              [Symbol.asyncIterator]: () => ({
+                next: () =>
+                  Promise.resolve({
+                    done: false,
+                    value: create(StringValueSchema),
+                  }),
+                return: returned,
+              }),
+            },
+          };
+        },
+      });
+      const it = res.message[Symbol.asyncIterator]();
+      await it.next();
+      controller.abort();
+      await it.return?.();
+      await expectAsync(it.next()).toBeRejectedWith(
+        jasmine.objectContaining({ code: Code.Canceled }),
+      );
+      expect(finished).toHaveBeenCalledOnceWith(Code.Canceled);
+      expect(returned).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not start a call through an unused lazy iterable", async () => {
+      const started = jasmine.createSpy("started");
+      async function* stream() {
+        const res = await runStreamingCall({
+          req: makeReq(),
+          async next(req) {
+            started();
+            return makeRes(req);
+          },
+        });
+        yield* res.message;
+      }
+      await stream().return();
+      expect(started).not.toHaveBeenCalled();
+    });
   });
 });

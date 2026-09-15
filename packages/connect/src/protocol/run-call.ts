@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import type { DescMessage, MessageInitShape } from "@bufbuild/protobuf";
+import type {
+  DescMessage,
+  MessageInitShape,
+  MessageShape,
+} from "@bufbuild/protobuf";
 import type {
   Interceptor,
   StreamRequest,
@@ -22,6 +26,7 @@ import type {
 } from "../interceptor.js";
 import { applyInterceptors } from "../interceptor.js";
 import { ConnectError } from "../connect-error.js";
+import { Code } from "../code.js";
 import {
   createDeadlineSignal,
   createLinkedAbortController,
@@ -86,7 +91,7 @@ type StreamingFn<
  * Runs a server-streaming method with the given interceptors. Note that this
  * function is only used when implementing a Transport.
  */
-export function runStreamingCall<
+export async function runStreamingCall<
   I extends DescMessage,
   O extends DescMessage,
 >(opt: {
@@ -98,58 +103,176 @@ export function runStreamingCall<
   signal?: AbortSignal;
   interceptors?: Interceptor[];
 }): Promise<StreamResponse<I, O>> {
-  const next = applyInterceptors(opt.next, opt.interceptors);
+  const request = opt.req.message[Symbol.asyncIterator]();
+  let requestReturned: Promise<IteratorResult<MessageInitShape<I>>> | undefined;
+  let requestThrown: Promise<IteratorResult<MessageInitShape<I>>> | undefined;
+  const requestIterator: Required<AsyncIterator<MessageInitShape<I>>> = {
+    next: () => request.next(),
+    return(value) {
+      requestReturned ??= new Promise((resolve) =>
+        resolve(request.return?.(value) ?? { done: true, value }),
+      );
+      return requestReturned;
+    },
+    throw(reason) {
+      requestThrown ??= new Promise((resolve) =>
+        resolve(request.throw?.(reason) ?? { done: true, value: undefined }),
+      );
+      return requestThrown;
+    },
+  };
   const [signal, abort, done] = setupSignal(opt);
+  let state: "open" | "done" | ConnectError = "open";
+  let responseIterator: AsyncIterator<MessageShape<O>> | undefined;
+  let closing: Promise<void> | undefined;
+
+  function closeResponse(): Promise<void> {
+    const it = responseIterator;
+    if (it === undefined) {
+      return Promise.resolve();
+    }
+    closing ??= Promise.resolve()
+      .then(async () => {
+        try {
+          while ((await it.next()).done !== true) {
+            // Discard buffered interceptor output to reach the aborted source.
+          }
+        } finally {
+          await it.return?.();
+        }
+      })
+      .catch(() => {
+        // Cleanup must not replace the terminal RPC error.
+      });
+    return closing;
+  }
+
+  function fail(reason: unknown): ConnectError {
+    // Completion aborts the transport signal, but does not cancel queued reads.
+    if (state === "done") {
+      return ConnectError.from(reason);
+    }
+    if (state instanceof ConnectError) {
+      return state;
+    }
+    const error = ConnectError.from(
+      signal.aborted ? getAbortSignalReason(signal) : reason,
+    );
+    state = error;
+    signal.removeEventListener("abort", onAbort);
+    // Interrupt pending reads before waiting for iterator cleanup.
+    void abort(error).catch(() => {});
+    void requestIterator.throw(error).catch(() => {});
+    void requestIterator.return().catch(() => {});
+    void closeResponse();
+    return error;
+  }
+
+  function onAbort() {
+    fail(getAbortSignalReason(signal));
+  }
+
+  function checkSignal() {
+    if (state !== "done" && signal.aborted) {
+      throw fail(getAbortSignalReason(signal));
+    }
+  }
+
   const req = {
     ...opt.req,
-    message: normalizeIterable(opt.req.method.input, opt.req.message),
+    message: normalizeIterable(opt.req.method.input, {
+      [Symbol.asyncIterator]: () => requestIterator,
+    }),
     signal,
   };
-  let doneCalled = false;
-  // Call return on the request iterable to indicate
-  // that we will no longer consume it and it should
-  // cleanup any allocated resources.
-  signal.addEventListener("abort", function () {
-    const it = opt.req.message[Symbol.asyncIterator]();
-    // If the signal is aborted due to an error, we want to throw
-    // the error to the request iterator.
-    if (!doneCalled) {
-      it.throw?.(this.reason).catch(() => {
-        // throw returns a promise, which we don't care about.
-        //
-        // Uncaught promises are thrown at sometime/somewhere by the event loop,
-        // this is to ensure error is caught and ignored.
-      });
-    }
-    it.return?.().catch(() => {
-      // return returns a promise, which we don't care about.
-      //
-      // Uncaught promises are thrown at sometime/somewhere by the event loop,
-      // this is to ensure error is caught and ignored.
-    });
-  });
-  return next(req).then((res) => {
-    return {
-      ...res,
-      message: {
-        [Symbol.asyncIterator]() {
-          const it = res.message[Symbol.asyncIterator]();
-          return {
-            next() {
-              return it.next().then((r) => {
-                if (r.done == true) {
-                  doneCalled = true;
-                  done();
+  signal.addEventListener("abort", onAbort);
+  try {
+    checkSignal();
+    const next = applyInterceptors<StreamingFn<I, O>>(async (req) => {
+      try {
+        checkSignal();
+        const res = await opt.next(req);
+        return {
+          ...res,
+          message: (async function* () {
+            const it = res.message[Symbol.asyncIterator]();
+            try {
+              for (;;) {
+                checkSignal();
+                const result = await it.next();
+                checkSignal();
+                if (result.done === true) {
+                  return;
                 }
-                return r;
-              }, abort);
-            },
-            // We deliberately omit throw/return.
-          };
-        },
+                yield result.value;
+              }
+            } catch (reason) {
+              throw fail(reason);
+            } finally {
+              await Promise.resolve()
+                .then(() => it.return?.())
+                .catch((reason) => {
+                  throw fail(reason);
+                });
+            }
+          })(),
+        };
+      } catch (reason) {
+        throw fail(reason);
+      }
+    }, opt.interceptors);
+    const res = await next(req);
+    const it = res.message[Symbol.asyncIterator]();
+    responseIterator = it;
+    if (signal.aborted) {
+      await closeResponse();
+      checkSignal();
+    }
+    const iterator: AsyncIterator<MessageShape<O>> = {
+      async next() {
+        if (state instanceof ConnectError) {
+          throw state;
+        }
+        if (state === "done") {
+          return { done: true, value: undefined };
+        }
+        try {
+          const result = await it.next();
+          checkSignal();
+          if (result.done === true && state === "open") {
+            state = "done";
+            signal.removeEventListener("abort", onAbort);
+            done();
+            void requestIterator.return().catch(() => {});
+          }
+          return result;
+        } catch (reason) {
+          throw fail(reason);
+        }
+      },
+      async return(value) {
+        if (state !== "done") {
+          fail(new ConnectError("the operation was canceled", Code.Canceled));
+          await closeResponse();
+        }
+        return { done: true, value };
+      },
+      async throw(reason) {
+        if (state === "done") {
+          throw ConnectError.from(reason);
+        }
+        const error = fail(reason);
+        await closeResponse();
+        throw error;
       },
     };
-  }, abort);
+    return {
+      ...res,
+      message: { [Symbol.asyncIterator]: () => iterator },
+    };
+  } catch (reason) {
+    throw fail(reason);
+  }
 }
 
 /**
