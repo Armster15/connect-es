@@ -122,7 +122,8 @@ export async function runStreamingCall<
     },
   };
   const [signal, abort, done] = setupSignal(opt);
-  let state: "open" | "done" | ConnectError = "open";
+  let state: "open" | "done" | "returned" | ConnectError = "open";
+  let pendingReads = 0;
   let responseIterator: AsyncIterator<MessageShape<O>> | undefined;
   let closing: Promise<void> | undefined;
 
@@ -135,7 +136,7 @@ export async function runStreamingCall<
       .then(async () => {
         try {
           while ((await it.next()).done !== true) {
-            // Discard buffered interceptor output to reach the aborted source.
+            // Discard buffered interceptor output to reach the closed source.
           }
         } finally {
           await it.return?.();
@@ -149,7 +150,7 @@ export async function runStreamingCall<
 
   function fail(reason: unknown): ConnectError {
     // Completion aborts the transport signal, but does not cancel queued reads.
-    if (state === "done") {
+    if (state === "done" || state === "returned") {
       return ConnectError.from(reason);
     }
     if (state instanceof ConnectError) {
@@ -173,9 +174,10 @@ export async function runStreamingCall<
   }
 
   function checkSignal() {
-    if (state !== "done" && signal.aborted) {
+    if (state !== "done" && state !== "returned" && signal.aborted) {
       throw fail(getAbortSignalReason(signal));
     }
+    return state;
   }
 
   const req = {
@@ -198,21 +200,29 @@ export async function runStreamingCall<
             const it = res.message[Symbol.asyncIterator]();
             try {
               for (;;) {
-                checkSignal();
+                if (checkSignal() === "returned") {
+                  return;
+                }
                 const result = await it.next();
-                checkSignal();
+                if (checkSignal() === "returned") {
+                  return;
+                }
                 if (result.done === true) {
                   return;
                 }
                 yield result.value;
               }
             } catch (reason) {
-              throw fail(reason);
+              if (state !== "returned") {
+                throw fail(reason);
+              }
             } finally {
               await Promise.resolve()
                 .then(() => it.return?.())
                 .catch((reason) => {
-                  throw fail(reason);
+                  if (state !== "returned") {
+                    throw fail(reason);
+                  }
                 });
             }
           })(),
@@ -233,9 +243,10 @@ export async function runStreamingCall<
         if (state instanceof ConnectError) {
           throw state;
         }
-        if (state === "done") {
+        if (state === "done" || state === "returned") {
           return { done: true, value: undefined };
         }
+        pendingReads++;
         try {
           const result = await it.next();
           checkSignal();
@@ -248,17 +259,28 @@ export async function runStreamingCall<
           return result;
         } catch (reason) {
           throw fail(reason);
+        } finally {
+          pendingReads--;
         }
       },
       async return(value) {
+        if (state === "open") {
+          if (pendingReads === 0) {
+            state = "returned";
+            signal.removeEventListener("abort", onAbort);
+            done();
+            void requestIterator.return().catch(() => {});
+          } else {
+            fail(new ConnectError("the operation was canceled", Code.Canceled));
+          }
+        }
         if (state !== "done") {
-          fail(new ConnectError("the operation was canceled", Code.Canceled));
           await closeResponse();
         }
         return { done: true, value };
       },
       async throw(reason) {
-        if (state === "done") {
+        if (state === "done" || state === "returned") {
           throw ConnectError.from(reason);
         }
         const error = fail(reason);

@@ -356,7 +356,7 @@ describe("runStreamingCall()", () => {
         "parked",
         "pending read",
       ] as const) {
-        it(`finalizes on ${action} while ${position}, retaining the error after cleanup`, async () => {
+        it(`finalizes on ${action} while ${position}, retaining the terminal state after cleanup`, async () => {
           const controller = new AbortController();
           const finished = jasmine.createSpy("finished");
           const sourceClosed = jasmine.createSpy("sourceClosed");
@@ -382,8 +382,12 @@ describe("runStreamingCall()", () => {
             readStarted = resolve;
           });
           const error = new ConnectError("consumer failed", Code.DataLoss);
-          const code =
-            action === "deadline"
+          const cleanReturn =
+            action === "return" &&
+            (position === "unread" || position === "parked");
+          const code = cleanReturn
+            ? undefined
+            : action === "deadline"
               ? Code.DeadlineExceeded
               : action === "throw"
                 ? Code.DataLoss
@@ -467,10 +471,14 @@ describe("runStreamingCall()", () => {
             }
             expect(requestIterators).toHaveBeenCalledTimes(1);
             expect(requestReturned).toHaveBeenCalledTimes(1);
-            expect(requestThrown).toHaveBeenCalledTimes(1);
-            await expectAsync(it.next()).toBeRejectedWith(
-              jasmine.objectContaining({ code }),
-            );
+            expect(requestThrown).toHaveBeenCalledTimes(cleanReturn ? 0 : 1);
+            if (cleanReturn) {
+              expect(await it.next()).toEqual({ done: true, value: undefined });
+            } else {
+              await expectAsync(it.next()).toBeRejectedWith(
+                jasmine.objectContaining({ code }),
+              );
+            }
             await it.return?.();
             await it.return?.();
             expect(finished).toHaveBeenCalledTimes(1);
@@ -484,55 +492,179 @@ describe("runStreamingCall()", () => {
       }
     }
 
-    it("reports cancellation through a buffering interceptor without prefetching", async () => {
-      const finished = jasmine.createSpy("finished");
-      const sourceClosed = jasmine.createSpy("sourceClosed");
-      let sourceReads = 0;
-      const duplicate: Interceptor = (next) => async (req) => {
-        const res = await next(req);
-        if (!res.stream) {
-          return res;
-        }
-        return {
-          ...res,
-          message: (async function* () {
-            for await (const message of res.message) {
-              for (let i = 0; i < 3; i++) {
-                yield message;
+    for (const action of ["return", "abort"] as const) {
+      it(`reports ${action} through a buffering interceptor without prefetching`, async () => {
+        const controller = new AbortController();
+        const finished = jasmine.createSpy("finished");
+        const sourceClosed = jasmine.createSpy("sourceClosed");
+        let sourceReads = 0;
+        const duplicate: Interceptor = (next) => async (req) => {
+          const res = await next(req);
+          if (!res.stream) {
+            return res;
+          }
+          return {
+            ...res,
+            message: (async function* () {
+              for await (const message of res.message) {
+                for (let i = 0; i < 3; i++) {
+                  yield message;
+                }
               }
-            }
-          })(),
+            })(),
+          };
         };
+        const res = await runStreamingCall({
+          req: makeReq(),
+          signal: controller.signal,
+          interceptors: [trace(finished), duplicate],
+          async next(req) {
+            return {
+              ...makeRes(req),
+              message: (async function* () {
+                try {
+                  for (const value of ["first", "second"]) {
+                    sourceReads++;
+                    yield create(StringValueSchema, { value });
+                  }
+                } finally {
+                  sourceClosed();
+                }
+              })(),
+            };
+          },
+        });
+        const it = res.message[Symbol.asyncIterator]();
+        expect(sourceReads).toBe(0);
+        expect((await it.next()).value).toEqual(
+          create(StringValueSchema, { value: "first" }),
+        );
+        expect(sourceReads).toBe(1);
+        if (action === "abort") {
+          controller.abort();
+        }
+        await it.return?.();
+        expect(finished).toHaveBeenCalledOnceWith(
+          action === "return" ? undefined : Code.Canceled,
+        );
+        expect(sourceReads).toBe(1);
+        expect(sourceClosed).toHaveBeenCalledTimes(1);
+        if (action === "return") {
+          expect(await it.next()).toEqual({ done: true, value: undefined });
+        } else {
+          await expectAsync(it.next()).toBeRejectedWith(
+            jasmine.objectContaining({ code: Code.Canceled }),
+          );
+        }
+      });
+    }
+
+    it("closes a for-await break cleanly and releases resources without another read", async () => {
+      const finished = jasmine.createSpy("finished");
+      const returned = jasmine
+        .createSpy("returned")
+        .and.resolveTo({ done: true });
+      const thrown = jasmine.createSpy("thrown").and.resolveTo({ done: true });
+      const request = makeReq();
+      request.message = {
+        [Symbol.asyncIterator]: () => ({
+          next: () => Promise.resolve({ done: true, value: undefined }),
+          return: returned,
+          throw: thrown,
+        }),
       };
+      const cleared = spyOn(globalThis, "clearTimeout").and.callThrough();
+      let signal: AbortSignal | undefined;
+      const read = jasmine
+        .createSpy("read")
+        .and.resolveTo({ done: false, value: create(StringValueSchema) });
+      const sourceReturned = jasmine
+        .createSpy("sourceReturned")
+        .and.callFake(() => Promise.reject(signal?.reason));
+      const res = await runStreamingCall({
+        req: request,
+        timeoutMs: 100,
+        interceptors: [trace(finished)],
+        async next(req) {
+          signal = req.signal;
+          return {
+            ...makeRes(req),
+            message: {
+              [Symbol.asyncIterator]: () => ({
+                next: read,
+                return: sourceReturned,
+              }),
+            },
+          };
+        },
+      });
+      for await (const message of res.message) {
+        expect(message).toEqual(create(StringValueSchema));
+        break;
+      }
+      const it = res.message[Symbol.asyncIterator]();
+      await it.return?.();
+      expect(finished).toHaveBeenCalledOnceWith(undefined);
+      expect(signal?.aborted).toBeTrue();
+      expect(cleared).toHaveBeenCalledTimes(1);
+      expect(returned).toHaveBeenCalledTimes(1);
+      expect(thrown).not.toHaveBeenCalled();
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(sourceReturned).toHaveBeenCalledTimes(1);
+      expect(await it.next()).toEqual({ done: true, value: undefined });
+    });
+
+    it("cancels return when one of multiple public reads is still pending", async () => {
       const res = await runStreamingCall({
         req: makeReq(),
-        interceptors: [trace(finished), duplicate],
+        interceptors: [
+          (next) => async (req) => {
+            const res = await next(req);
+            if (!res.stream) {
+              return res;
+            }
+            const source = res.message[Symbol.asyncIterator]();
+            let reads = 0;
+            return {
+              ...res,
+              message: {
+                [Symbol.asyncIterator]: () => ({
+                  next() {
+                    reads++;
+                    return reads === 2
+                      ? Promise.resolve({
+                          done: false,
+                          value: create(req.method.output),
+                        })
+                      : source.next();
+                  },
+                }),
+              },
+            };
+          },
+        ],
         async next(req) {
           return {
             ...makeRes(req),
             message: (async function* () {
-              try {
-                for (const value of ["first", "second"]) {
-                  sourceReads++;
-                  yield create(StringValueSchema, { value });
-                }
-              } finally {
-                sourceClosed();
+              if (!req.signal.aborted) {
+                await new Promise<void>((resolve) =>
+                  req.signal.addEventListener("abort", () => resolve(), {
+                    once: true,
+                  }),
+                );
               }
             })(),
           };
         },
       });
       const it = res.message[Symbol.asyncIterator]();
-      expect(sourceReads).toBe(0);
-      expect((await it.next()).value).toEqual(
-        create(StringValueSchema, { value: "first" }),
+      const pending = expectAsync(it.next()).toBeRejectedWith(
+        jasmine.objectContaining({ code: Code.Canceled }),
       );
-      expect(sourceReads).toBe(1);
+      expect((await it.next()).done).toBeFalse();
       await it.return?.();
-      expect(finished).toHaveBeenCalledOnceWith(Code.Canceled);
-      expect(sourceReads).toBe(1);
-      expect(sourceClosed).toHaveBeenCalledTimes(1);
+      await pending;
       await expectAsync(it.next()).toBeRejectedWith(
         jasmine.objectContaining({ code: Code.Canceled }),
       );
