@@ -24,8 +24,18 @@ import {
 } from "./serialization.js";
 import { Code } from "../code.js";
 import { ConnectError } from "../connect-error.js";
-import { StringValueSchema, UInt32ValueSchema } from "@bufbuild/protobuf/wkt";
-import { clone, create, equals, toBinary } from "@bufbuild/protobuf";
+import {
+  SourceContextSchema,
+  StringValueSchema,
+  UInt32ValueSchema,
+} from "@bufbuild/protobuf/wkt";
+import {
+  clone,
+  create,
+  equals,
+  fromBinary,
+  toBinary,
+} from "@bufbuild/protobuf";
 import { createServiceDesc } from "../descriptor-helper.spec.js";
 
 describe("createMethodSerializationLookup()", () => {
@@ -92,6 +102,141 @@ describe("createMethodSerializationLookup()", () => {
       { code: Code.ResourceExhausted },
     );
   });
+
+  for (const returnDefaults of [false, true]) {
+    it(`preserves codec identity when the factory returns ${returnDefaults ? "defaults" : "undefined"}`, () => {
+      const serializers: unknown[] = [];
+      let factoryCalls = 0;
+      const lookup = createMethodSerializationLookup(
+        method,
+        undefined,
+        undefined,
+        limits,
+        (factoryMethod, defaults) => {
+          factoryCalls++;
+          assert.strictEqual(factoryMethod, method);
+          serializers.push(
+            defaults.getI(true),
+            defaults.getI(false),
+            defaults.getO(true),
+            defaults.getO(false),
+          );
+          return returnDefaults ? defaults : undefined;
+        },
+      );
+      assert.strictEqual(factoryCalls, 1);
+      assert.strictEqual(lookup.getI(true), serializers[0]);
+      assert.strictEqual(lookup.getI(false), serializers[1]);
+      assert.strictEqual(lookup.getO(true), serializers[2]);
+      assert.strictEqual(lookup.getO(false), serializers[3]);
+      assert.deepStrictEqual(
+        lookup.getI(true).serialize(create(StringValueSchema)),
+        new Uint8Array(),
+      );
+      assert.deepStrictEqual(lookup.getO(false).parse(jsonBytes), message);
+    });
+  }
+
+  it("gives the factory defaults with the configured binary and JSON options", () => {
+    const method = createServiceDesc({
+      typeName: "OptionsService",
+      method: {
+        unary: {
+          input: SourceContextSchema,
+          output: SourceContextSchema,
+          methodKind: "unary",
+        },
+      },
+    }).method.unary;
+    const message = create(SourceContextSchema, { fileName: "test.proto" });
+    const binaryBytes = toBinary(SourceContextSchema, message);
+    const unknownBytes = new Uint8Array([...binaryBytes, 0x10, 1]);
+    const messageWithUnknownFields = fromBinary(
+      SourceContextSchema,
+      unknownBytes,
+    );
+    const jsonBytes = new TextEncoder().encode('{"file_name":"test.proto"}');
+    const lookup = createMethodSerializationLookup(
+      method,
+      { readUnknownFields: false, writeUnknownFields: false },
+      { ignoreUnknownFields: false, useProtoFieldName: true },
+      { readMaxBytes: 64, writeMaxBytes: 64 },
+      (_method, defaults) => defaults,
+    );
+    for (const serialization of [lookup.getI(true), lookup.getO(true)]) {
+      assert.deepStrictEqual(serialization.parse(unknownBytes), message);
+      assert.deepStrictEqual(
+        serialization.serialize(messageWithUnknownFields),
+        binaryBytes,
+      );
+    }
+    for (const serialization of [lookup.getI(false), lookup.getO(false)]) {
+      assert.deepStrictEqual(serialization.serialize(message), jsonBytes);
+      assert.deepStrictEqual(serialization.parse(jsonBytes), message);
+      assert.throws(
+        () =>
+          serialization.parse(new TextEncoder().encode('{"unknown":"field"}')),
+        { code: Code.InvalidArgument },
+      );
+    }
+  });
+
+  for (const useBinaryFormat of [true, false]) {
+    it(`accepts custom bytes at the limit and rejects oversized bytes before parsing (${useBinaryFormat ? "binary" : "JSON"})`, () => {
+      let bytes = new Uint8Array([0xff, 0x00, 0x80]);
+      let parsed = 0;
+      const factory: MethodSerializationFactory = (method) => ({
+        getI: () => ({
+          serialize: () => bytes,
+          parse: () => {
+            parsed++;
+            return create(method.input);
+          },
+        }),
+        getO: () => ({
+          serialize: () => bytes,
+          parse: () => {
+            parsed++;
+            return create(method.output);
+          },
+        }),
+      });
+      const lookup = createMethodSerializationLookup(
+        method,
+        undefined,
+        undefined,
+        limits,
+        factory,
+      );
+      for (const serialization of [
+        lookup.getI(useBinaryFormat),
+        lookup.getO(useBinaryFormat),
+      ]) {
+        assert.strictEqual(
+          serialization.serialize(create(StringValueSchema)),
+          bytes,
+        );
+        assert.deepStrictEqual(
+          serialization.parse(bytes),
+          create(StringValueSchema),
+        );
+      }
+      bytes = new Uint8Array(4);
+      for (const serialization of [
+        lookup.getI(useBinaryFormat),
+        lookup.getO(useBinaryFormat),
+      ]) {
+        assert.throws(
+          () => serialization.serialize(create(StringValueSchema)),
+          { code: Code.ResourceExhausted },
+        );
+        assert.throws(() => serialization.parse(bytes), {
+          code: Code.ResourceExhausted,
+        });
+      }
+      assert.strictEqual(parsed, 2);
+    });
+  }
 });
 
 describe("createBinarySerialization()", () => {
