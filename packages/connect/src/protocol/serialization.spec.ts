@@ -12,16 +12,116 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import type { Serialization } from "./serialization.js";
+import type { MethodSerializationFactory, Serialization } from "../index.js";
 import {
   createBinarySerialization,
   createJsonSerialization,
+  createMethodSerializationLookup,
   getJsonOptions,
   limitSerialization,
 } from "./serialization.js";
 import { ConnectError } from "../connect-error.js";
 import { StringValueSchema, UInt32ValueSchema } from "@bufbuild/protobuf/wkt";
 import { clone, create, equals, toBinary } from "@bufbuild/protobuf";
+import { createServiceDesc } from "../descriptor-helper.spec.js";
+
+describe("createMethodSerializationLookup()", () => {
+  const method = createServiceDesc({
+    typeName: "TestService",
+    method: {
+      unary: {
+        input: StringValueSchema,
+        output: StringValueSchema,
+        methodKind: "unary",
+      },
+    },
+  }).method.unary;
+
+  for (const returnDefaults of [false, true]) {
+    it(`preserves defaults when the factory returns ${returnDefaults ? "defaults" : "undefined"}`, () => {
+      const serializers: unknown[] = [];
+      const lookup = createMethodSerializationLookup(
+        method,
+        undefined,
+        undefined,
+        { readMaxBytes: 3, writeMaxBytes: 3 },
+        (_method, defaults) => {
+          serializers.push(
+            defaults.getI(true),
+            defaults.getI(false),
+            defaults.getO(true),
+            defaults.getO(false),
+          );
+          return returnDefaults ? defaults : undefined;
+        },
+      );
+      expect(serializers[0]).toBe(lookup.getI(true));
+      expect(serializers[1]).toBe(lookup.getI(false));
+      expect(serializers[2]).toBe(lookup.getO(true));
+      expect(serializers[3]).toBe(lookup.getO(false));
+      expect(lookup.getI(true).serialize(create(StringValueSchema))).toEqual(
+        new Uint8Array(),
+      );
+      expect(lookup.getO(false).parse(new TextEncoder().encode('"a"'))).toEqual(
+        create(StringValueSchema, { value: "a" }),
+      );
+    });
+  }
+
+  for (const useBinaryFormat of [true, false]) {
+    it(`limits both custom serializers (${useBinaryFormat ? "binary" : "JSON"})`, () => {
+      let bytes = new Uint8Array([0xff, 0x00, 0x80]);
+      let parsed = 0;
+      const factory: MethodSerializationFactory = (method) => ({
+        getI: () => ({
+          serialize: () => bytes,
+          parse: () => {
+            parsed++;
+            return create(method.input);
+          },
+        }),
+        getO: () => ({
+          serialize: () => bytes,
+          parse: () => {
+            parsed++;
+            return create(method.output);
+          },
+        }),
+      });
+      const lookup = createMethodSerializationLookup(
+        method,
+        undefined,
+        undefined,
+        { readMaxBytes: 3, writeMaxBytes: 3 },
+        factory,
+      );
+      for (const serialization of [
+        lookup.getI(useBinaryFormat),
+        lookup.getO(useBinaryFormat),
+      ]) {
+        expect(serialization.serialize(create(StringValueSchema))).toBe(bytes);
+        expect(serialization.parse(bytes)).toEqual(create(StringValueSchema));
+      }
+      bytes = new Uint8Array(4);
+      for (const serialization of [
+        lookup.getI(useBinaryFormat),
+        lookup.getO(useBinaryFormat),
+      ]) {
+        expect(() =>
+          serialization.serialize(create(StringValueSchema)),
+        ).toThrowError(
+          ConnectError,
+          "[resource_exhausted] message size 4 is larger than configured writeMaxBytes 3",
+        );
+        expect(() => serialization.parse(bytes)).toThrowError(
+          ConnectError,
+          "[resource_exhausted] message size 4 is larger than configured readMaxBytes 3",
+        );
+      }
+      expect(parsed).toBe(2);
+    });
+  }
+});
 
 describe("createBinarySerialization()", () => {
   const goldenMessage = create(StringValueSchema, { value: "abc" });
