@@ -103,7 +103,13 @@ export async function runStreamingCall<
   signal?: AbortSignal;
   interceptors?: Interceptor[];
 }): Promise<StreamResponse<I, O>> {
-  const request = opt.req.message[Symbol.asyncIterator]();
+  let request: AsyncIterator<MessageInitShape<I>>;
+  try {
+    request = opt.req.message[Symbol.asyncIterator]();
+  } catch (reason) {
+    // Report acquisition failures through request reads so interceptors see them.
+    request = { next: () => Promise.reject(reason) };
+  }
   let requestReturned: Promise<IteratorResult<MessageInitShape<I>>> | undefined;
   let requestThrown: Promise<IteratorResult<MessageInitShape<I>>> | undefined;
   const requestIterator: Required<AsyncIterator<MessageInitShape<I>>> = {

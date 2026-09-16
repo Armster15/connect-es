@@ -22,6 +22,7 @@ import type {
 import { createAsyncIterable, encodeEnvelope } from "../protocol/index.js";
 import { ConnectError } from "../connect-error.js";
 import { Code } from "../code.js";
+import { createClient } from "../promise-client.js";
 import { createServiceDesc } from "../descriptor-helper.spec.js";
 import { Int32ValueSchema, StringValueSchema } from "@bufbuild/protobuf/wkt";
 import type { StringValue } from "@bufbuild/protobuf/wkt";
@@ -63,6 +64,53 @@ describe("gRPC transport", () => {
     useBinaryFormat: true,
     writeMaxBytes: 0xffffff,
   };
+
+  for (const failure of ["method", "getter"]) {
+    it(`reports request iterator ${failure} failures to the client and interceptors`, async () => {
+      const error = new Error("iterator acquisition failed");
+      const input: AsyncIterable<never> =
+        failure === "method"
+          ? {
+              [Symbol.asyncIterator]() {
+                throw error;
+              },
+            }
+          : {
+              get [Symbol.asyncIterator](): () => AsyncIterator<never> {
+                throw error;
+              },
+            };
+      let intercepted: unknown;
+      const client = createClient(
+        TestService,
+        createTransport({
+          ...defaultOptions,
+          interceptors: [
+            (next) => async (req) => {
+              try {
+                return await next(req);
+              } catch (reason) {
+                intercepted = reason;
+                throw reason;
+              }
+            },
+          ],
+          async httpClient(req) {
+            await req.body?.[Symbol.asyncIterator]().next();
+            throw new Error("expected request iterator to fail");
+          },
+        }),
+      );
+      const expected = jasmine.objectContaining({
+        code: Code.Unknown,
+        cause: error,
+      });
+      await expectAsync(client.client(input)).toBeRejectedWith(expected);
+      expect(intercepted).toBeInstanceOf(ConnectError);
+      expect(intercepted).toEqual(expected);
+    });
+  }
+
   describe("against server responding with an error", () => {
     let httpRequestAborted = false;
     let transport: Transport = null as unknown as Transport;
